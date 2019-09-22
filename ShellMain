@@ -1,0 +1,840 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <wait.h>
+#include <dirent.h>
+#include <ctype.h>
+
+#define INPUT_SIZE 513
+#define HISTORY_SIZE 20
+#define ALIAS_SIZE 10
+
+
+// struct
+typedef struct alias_node alias;
+struct alias_node{
+    int id;
+    char key[INPUT_SIZE - 8];
+    char command[INPUT_SIZE - 8];
+    alias *alias_next;
+};
+
+// Functions
+void tokenise(char *input, char **args); // Parse input into tokens.
+void alias_check(alias *alias_head, char *input, char **args );
+void history_commands(char **args, char *history, char *input, int count_history);
+void internal_commands(char **args, char *history, char *oldpwd); // Run internal processes excluding alias commands.
+alias* alias_commands(char **args, alias *alias_head); // Run alias commands. Uses dynamic linked list
+void external_commands(char **args); // Run external processes.
+void print_info(char message[500], int level);
+
+int main() {
+
+    // Save path to return to once program exits
+    char *original_path = getenv("PATH"); //saving the original path
+
+    // Set up the alias head for the linked list.
+    alias *alias_previous, *alias_current;
+    alias *alias_head = (alias*)malloc(sizeof(alias)); //sets up the first instance of the linked list.
+    if(alias_head == NULL) {
+        print_info("failed to allocate space for aliases.\n", 1);
+    }
+    else {
+        alias_head->id = -1;
+    }
+
+    // Get the user home dir
+    if(chdir(getenv("HOME")) != 0){ //changing the current working directory to the HOME directory
+        print_info("chdir() to HOME directory failed.", 1);
+    }
+
+    /*
+     * Gets the current working directory and prints it.
+     */
+    char oldpwd[200];
+    char cwd[200];
+    if(getcwd(cwd, sizeof(cwd)) != NULL){
+        print_info("Current working dir: ", 3);
+        printf("%s\n", cwd);
+        strcpy(oldpwd, cwd);
+    }
+    else{
+        print_info("getcwd() error\n", 1);
+    }
+
+    // makes space in memory for the input string.
+    char *input = calloc(INPUT_SIZE, sizeof(char));
+
+    // Makes space in memory for the history.
+    char history[HISTORY_SIZE][INPUT_SIZE + 1] = { '\0' };
+    int count_history = 0;
+    FILE *f;
+
+    // Load history.
+    char c;
+    int row = 0;
+    int column = 0;
+
+    f = fopen(".hist_list", "r");
+    if(f == NULL){
+        print_info("cannot read the history file.\n", 2);
+    }
+    else {
+        print_info("History file opened.\n", 3);
+        fseek(f, 0, SEEK_END);
+
+        if(ftell(f) == 0){
+            print_info("History file is empty.\n", 3);
+        }
+        else {
+            fseek(f, 0, SEEK_SET);
+
+            c = fgetc(f);
+            while(c != EOF){
+                history[row][column] = c;
+                column++;
+
+                if(c == '\n'){
+                    row++;
+                    column = 0;
+                    count_history++;
+                }
+                c = fgetc(f);
+            }
+        }
+        fclose(fopen(".hist_list", "w"));
+    }
+
+    // Read aliases from file;
+    char line[INPUT_SIZE] = { '\0' };
+    f = fopen(".aliases", "r");
+
+    alias *alias_temp;
+    alias_previous = alias_head;
+
+    if(f == NULL){
+        print_info("cannot read the alias file.\n", 2);
+    }
+    else {
+        print_info("Alias file opened.\n", 3);
+
+        fseek(f, 0, SEEK_END);
+        if (ftell(f) == 0) {
+            print_info("Alias file is empty.\n", 3);
+        } 
+        else {
+            fseek(f, 0, SEEK_SET);
+
+            while(fgets(line, INPUT_SIZE, f)){
+
+                line[strcspn(line, "\n")] = '\0';
+
+                if(alias_previous->id > (ALIAS_SIZE -1)){
+                    print_info("too many aliases in alias file; file is likely corrupted. For safety, please exit and delete the '.alias' file in your home directory before restarting.\n", 2);
+                    break;
+                }
+
+                if(line[0] == '\0'){
+                    print_info("saved aliases have been corrupted. For safety, please exit and delete the '.alias' file in your home directory before restarting.\n", 2);
+                    fgets(line, INPUT_SIZE, f);
+                }
+                else{
+                    if (alias_previous->id > -1) { // if it is not the initial node
+                        alias_current = (alias *) malloc(sizeof(alias));
+
+                        alias_current->id = alias_previous->id + 1; // set up the new node and set it as the previous node.
+                        alias_previous->alias_next = alias_current;
+                        alias_temp = alias_previous;
+                        alias_previous = alias_current;
+                    } 
+                    else { // Just change the alias id to 0 if it is the initial node.
+                        alias_previous->id = 0;
+                    }
+
+                    strcpy(alias_previous->key, line);
+                    line[0] = '\0';
+
+                    fgets(line, INPUT_SIZE, f);
+                    line[strcspn(line, "\n")] = '\0';
+
+                    if(line[0] == '\0'){
+                        print_info("saved aliases have been corrupted. For safety, please exit and delete the '.alias' file in your home directory before restarting.\n", 2);
+                        if(alias_previous->id > 0) {
+                            alias_previous = alias_temp;
+                            free(alias_current);
+                        }
+                        else {
+                            alias_previous->id = -1;
+                        }
+                    }
+                    else{
+                        strcpy(alias_previous->command, line);
+                    }
+                }
+                line[0] = '\0';
+            }
+        }
+    }
+
+    fclose(fopen(".aliases", "w"));
+
+
+
+    /*
+     * Displays prompt.
+     * Reads and parses user input continuously.
+     */
+    while(printf("\x1b[32muser > \x1b[0m") && fgets(input, INPUT_SIZE, stdin)) {
+        char **args = malloc(sizeof(char*) * 50);
+
+        // Checks to make sure the user input isn't too long.
+        char trash;
+        if((int)strlen(input) >= (INPUT_SIZE - 1)){
+            print_info("input longer than allowable limit.\n'", 2);
+            while((trash = getchar()) != '\n' && trash != EOF){
+                printf("%c", trash);
+            } //Gets rid of any overflow over 512 characters
+            printf("' was ignored.\n");
+            input[INPUT_SIZE - 1] = '\n';
+        }
+
+        
+        // Check whether the command is a history invocation and don't add it to history if it is.
+        char history_invocation[2] = "!";
+        char enter[2] = "\n";
+
+        if(strcspn(input, history_invocation) != 0) {
+            if (strcspn(input, enter) != 0) {
+
+                //If the array is full, shift all array elements by one position.
+                if (count_history == HISTORY_SIZE) {
+                    for (int i = 0; i < (HISTORY_SIZE - 1); i++) {
+                        strcpy(history[i], history[i + 1]);
+                    }
+                    count_history--;
+                }
+                // Add command to history.
+                strcpy(history[count_history], input);
+                count_history++;
+            }
+        }
+
+        // Split up the string into separate commands and arguments
+        tokenise(input, args);
+
+        // If there is some input...
+        if(args[0] != NULL) {
+
+            // Check whether it is an alias
+            alias_check(alias_head, input, args);
+            
+            // If the command is a history invocation replace it with the command from history and check if it is an alias.
+            if(strcmp(args[0], "!!") == 0 || (strcspn(args[0], "!") == 0 && strcspn(args[0], "-") == 1) || strcspn(args[0], "!") == 0){
+
+                history_commands(args, *history, input, count_history);
+                alias_check(alias_head, input, args);
+            }
+
+            // Check if the command is an internal command or an external command
+            if(strcmp(args[0], "exit") == 0){
+
+                break; // Breaks the while loop to exit the program
+            }
+            else if(strcmp(args[0], "getpath") == 0 || strcmp(args[0], "setpath") == 0 || strcmp(args[0], "cd") == 0 || strcmp(args[0], "history") == 0){
+
+                internal_commands(args, *history, &oldpwd[0]); // executes all internal commands not to do with aliases
+            }
+            else if(strcmp(args[0], "alias") == 0 || strcmp(args[0], "unalias") == 0) {
+
+                alias_head = alias_commands(args, alias_head); //executes internal commands to do with aliases
+            }
+            else if(strcspn(args[0], "!") == 0){
+            }
+            else { //execute external programs
+
+                external_commands(args);
+            }
+            
+            // Frees the memory space allocated to input and args
+            if (!*args) {
+                free(input);
+                free(args);
+            }
+        }
+    }
+
+    //When exiting using control + D follows the remaining code.
+    print_info("Exiting...\n", 3);
+
+    if(chdir(getenv("HOME")) != 0){ //changing the current working directory to the HOME directory
+        print_info("chdir() to HOME directory failed.\n", 1);
+    }
+
+    // Save history to a file.
+    f = fopen(".hist_list", "a");
+
+    for(int i=0;i < 20;i++){
+        if(strcmp(*history + i*(INPUT_SIZE + 1), "\0") != 0){
+            fprintf(f, "%s", *history + i*(INPUT_SIZE + 1));
+        }
+    }
+    fclose(f);
+
+    // Save aliases to a file
+    f = fopen(".aliases", "a");
+
+    alias_previous = alias_head;
+    alias_current = alias_head->alias_next;
+
+    if(alias_previous->id > -1){
+        while(alias_current != NULL){
+            fprintf(f, "%s\n%s\n", alias_previous->key, alias_previous->command);
+            alias_previous = alias_current;
+            alias_current = alias_current->alias_next;
+        }
+        fprintf(f, "%s\n%s\n", alias_previous->key, alias_previous->command);
+    }
+    
+    fclose(f);
+
+    // Set the path back to its original value
+    setenv("PATH", original_path, 1);
+    printf("The PATH was set to: %s\n", getenv("PATH"));
+
+    return 0;
+}
+
+
+/*
+ * tokenises the input string.
+ * Splits the input string by separating characters in the string so they can be parsed as commands or arguments.
+ */
+void tokenise(char *input,char **args){
+    const char delimit[13] = " |><&;\t\n\v\f\r\0";
+    char *token;
+
+    int position = 0;
+
+    token = strtok(input, delimit);
+
+    while (token != NULL) {
+        args[position] = token;
+        position++;
+        token = strtok(NULL, delimit);
+    }
+    args[position] = NULL;
+
+    char **iterator = args;
+    while (*iterator) {
+        puts(*iterator++);
+    }
+}
+
+
+/*
+ * Checks if command is an alias.
+ */
+void alias_check(alias *alias_head, char *input, char **args) {
+    alias *alias_previous, *alias_current;
+    char alias_hist[ALIAS_SIZE] = { '\0' };
+    char exit = 0, found = 0;
+    int pos = 0;
+
+    if(strcmp(args[0], "alias") != 0 && strcmp(args[0], "unalias") != 0){
+        while(exit == 0 || found == 1) {
+            found = 0; exit = 0;
+            alias_previous = alias_head;
+            alias_current = alias_head->alias_next;
+            // Searches each node of the linked list to see if a key matches the input.
+            while(alias_current != NULL){ 
+                while(args[pos] != NULL){
+                    if(strcmp(args[pos], alias_previous->key) == 0){
+                        exit = 1;
+                        break;
+                    }
+                    pos++;
+                }
+                if(exit == 1){
+                    break;
+                }
+                pos = 0;
+                alias_previous = alias_current;
+                alias_current = alias_current->alias_next;
+            }
+
+            exit = 0;
+            char command[INPUT_SIZE] = { '\0' };
+            while(args[pos] != NULL){
+
+                if(strcmp(args[pos], alias_previous->key) == 0) {
+                    found = 1;
+                    if(alias_hist[alias_previous->id] == '1'){
+                        print_info("possible infinite loop detected. Stopping aliasing.\n", 2);
+                        exit = 1;
+                        found = 0;
+                        break;
+                    }
+
+                    alias_hist[alias_previous->id] = '1';
+                    
+                    // Replaces the old input with the command the key represents and retokenises it.
+                    for(int i = 0; i < pos; i++){
+                        strcat(command, args[i]);
+                        strcat(command, " ");
+                    }
+                    
+                    strcat(command, alias_previous->command); 
+                    pos++;
+                    while(args[pos] != NULL){
+                        strcat(command, " ");
+                        strcat(command, args[pos]);
+                        pos++;
+                    }
+                    
+                    print_info("Replacing alias ", 3);
+                    printf("'%s'", alias_previous->key);
+                    print_info(" with command ",3);
+                    printf("'%s'\n", alias_previous->command);
+                    strcpy(input, command);
+                    if(!*args){
+                        free(args);
+                    }
+                    tokenise(input, args);
+                }
+                pos++;
+            }
+            if(args[pos] == NULL){
+                exit = 1;
+            }
+            pos = 0;
+        }
+    }
+}
+
+
+/*
+ * Executes commands to do with retrieving history.
+ */
+void history_commands(char **args, char *history, char *input, int count_history){
+    int number = -1, arg_val = 0;
+
+    if(args[1] != NULL){
+        print_info("extra arguments for history commands ignored.\n", 2);
+    }
+
+    // Execute the latest command entered to history.
+    if(strcmp(args[0], "!!") == 0){
+        if(count_history == 0){
+            print_info("The history is empty.\n", 3);
+        } 
+        else {
+            strcpy(input, history + (count_history - 1) * (INPUT_SIZE + 1));
+            tokenise(input, args);
+        }
+        if(args[1] != NULL){
+            print_info("no extra arguments accepted.\n", 2);
+        }
+    } // Execute the command which number is the number given by the command
+    else if(strcspn(args[0], "!") == 0 && strcspn(args[0], "\0") != 1) {
+        
+        // if true, execute the command which number is the number given by the command, subtracted from the current history number.
+        if (strcspn(args[0], "-") == 1){
+            arg_val++;
+            number = 1;
+        }
+        if(args[0][1 + arg_val] != '\0'){
+            if(args[0][3 + arg_val] == '\0' || args[0][2 + arg_val] == '\0') {
+                // Converts the number given as a char into an integer.
+                if (isdigit(args[0][1 + arg_val])) {
+                    int big_int = (args[0][1 + arg_val] - '0');
+                    if (isdigit(args[0][2 + arg_val])) {
+                        int small_int = (args[0][2 + arg_val]) - '0';
+                        big_int = (big_int * 10) + small_int;
+                    }
+                    else if(args[0][2 + arg_val] == '\0'){
+                    }
+                    else {
+                        print_info("a number was expected.\n", 1);
+                        return;
+                    }
+                    number += big_int;
+
+                } else {
+                    print_info("a number was expected.\n", 1);
+                    return;
+                }
+
+                // Checks if the number is valid
+                if(number > -1 && number < 21) {
+
+                    // Executes if the number should be taken away from the current history number
+                    if(arg_val == 1){
+                        if (count_history - number < 0) {
+                            print_info("there is no such number in the history.\n", 2);
+                        } else {
+                            strcpy(input, history + (count_history - number) * (INPUT_SIZE + 1));
+                            tokenise(input, args);
+                        }
+                    } // Executes if the number is the number that should be executed in history.
+                    else if(arg_val == 0) {
+                        if (strcmp(history + number * (INPUT_SIZE + 1), "\0") == 0) {
+                            print_info("there is no such number in the history.\n", 2);
+                        } else {
+                            strcpy(input, history + number * (INPUT_SIZE + 1));
+                            tokenise(input, args);
+                        }
+                    }
+                    else {
+                        print_info("fatal history malfunction.\n", 1);
+                    }
+                }
+                else {
+                    print_info("the number was not valid.\n", 1);
+                }
+            }
+            else {
+                print_info("number invalid or too large.\n", 1);
+            }
+        }
+    }
+}
+
+
+/*
+ * Executes the internal commands in the program.
+ */
+void internal_commands(char **args, char *history, char *oldpwd){
+    char cwd[200];
+    char temp_pwd[200];
+
+    // Exiting the shell if the user writes "exit".
+    if (strcmp(args[0], "getpath") == 0) {
+        printf("PATH: %s\n", getenv("PATH"));
+        if(args[1] != NULL){
+            print_info("no arguments accepted for getpath command.\n", 2);
+        }
+    } // Sets the path environment and validates it is an existing directory
+    else if (strcmp(args[0], "setpath") == 0) {
+        if(args[2] != NULL){
+            print_info("too many arguments for setpath command.\n", 1);
+        }
+        else if (args[1] == NULL) {
+            print_info("argument for the new PATH not provided.\n", 1);
+        } 
+        else {
+            DIR* path_exists = opendir(args[1]);
+            if(path_exists){
+                closedir(path_exists);
+                setenv("PATH", args[1], 1);
+                print_info("The PATH was set to: ", 3);
+                printf("%s\n", getenv("PATH"));
+            } 
+            else {
+                print_info("Argument for the new path was invalid.\n", 1);
+            }
+        }
+    } // Pareses the cd command
+    else if (strcmp(args[0], "cd") == 0) {
+        // Returns the user to the home directory if no other argument is given.
+        if (args[1] == NULL) {
+            getcwd(oldpwd, sizeof(oldpwd));
+
+            if (chdir(getenv("HOME")) != 0) {
+                print_info("chdir() to HOME directory failed.\n", 1);
+            }
+            if (getcwd(cwd, sizeof(cwd)) != NULL) {
+                print_info("Current working dir: ", 3); 
+                printf("%s\n", cwd);
+            } 
+            else {
+                print_info("Command cd couldn't be executed.\n", 1);
+            }
+        } // Otherwise changes the directory to the path given
+        else{
+            
+            // Looks for ~ in the command and replaces it with the path to the home directory
+            if(args[1][0] == '~'){ 
+                char *p_args = args[1];
+                args[1] = strcat(getenv("HOME"), (p_args + 1));
+            }
+            else if(strcmp(args[1], "-") == 0) {
+                strcpy(args[1], oldpwd);
+            }
+
+            getcwd(temp_pwd, sizeof(temp_pwd));
+            // changes the directory to the given path.
+            if(chdir(args[1]) != 0){
+                perror("Error");
+            }
+            else {
+                print_info("Current working dir: ", 3);
+                printf("%s\n", getcwd(cwd, sizeof(cwd)));
+                strcpy(oldpwd, temp_pwd);
+            }
+
+            if(args[2] != NULL){
+                print_info("only one path or argument accepted.\n", 2);
+            }
+        }
+    } // Prints all of history to the terminal and numbers each entry.
+    else if(strcmp(args[0], "history") == 0) {
+        for(int i = 0; i < 20; i++){
+            if(strcmp(history + i*(INPUT_SIZE + 1), "\0") != 0){
+                printf("%d  %s", i+1, history + i*(INPUT_SIZE + 1));
+            }
+        }
+        if(args[1] != NULL){
+            print_info("no extra arguments accepted.\n", 2);
+        }
+    }
+}
+
+
+/*
+ * Prints all the set aliases, sets an alias, or unaliases an alias.
+ */
+alias* alias_commands(char **args, alias *alias_head){
+    alias *alias_previous, *alias_current;
+    int pos;
+    char n_command[INPUT_SIZE];
+    alias_previous = alias_head; // Sets alias_previous to the first alias in the linked list and alias_current to the next one if it exists.
+    alias_current = alias_head->alias_next;
+
+    // If there are no arguments print all current aliases.
+    if(strcmp(args[0], "alias") == 0) {
+        if(args[1] == NULL){
+            if(alias_previous->id == -1){ // if the id is -1 then no aliases have been set
+                print_info("There are no aliases set.\n", 3);
+            }
+            else {
+                print_info("Set aliases:\n", 3);
+                while(alias_current != NULL){ // loops through each alias in the linked list and prints its key and its command
+                    printf("alias %s = '%s'\n", alias_previous->key, alias_previous->command);
+                    alias_previous = alias_current;
+                    alias_current = alias_current->alias_next;                
+                }
+                printf("alias %s = '%s'\n", alias_previous->key, alias_previous->command); //Prints the last one left in the list
+            }
+        } // Otherwise make a new alias for the given command
+        else if(args[1] != NULL && args[2] != NULL) { 
+
+            if(strcmp(args[1], "exit") == 0 || strcmp(args[1], "alias") == 0 || strcmp(args[1], "unalias") == 0){
+                print_info("the words 'exit', 'alias', and 'unalias' are protected to maintain program usability.\n", 1);
+                return alias_head;
+            }
+
+            if(alias_previous->id == 0) {
+                // Find the next space for an alias
+                while(alias_current != NULL){ 
+                    // Check for an alais with the same key.
+                    if(strcmp(alias_previous->key, args[1]) == 0){ 
+                        print_info("alias has already been assigned to a command.\n", 1);
+                        return alias_head;
+                    }
+                    // If an id was deleted use that space
+                    if((alias_previous->id + 1) != alias_current->id){ 
+                        break;
+                    }
+                    // otherwise check the next space
+                    alias_previous = alias_current;
+                    alias_current = alias_current->alias_next;
+                }
+
+                // Check the last alias for the same key.
+                if(strcmp(alias_previous->key, args[1]) == 0){ 
+                    print_info("alias has already been assigned to a command.\n", 1);
+                    return alias_head;
+                }
+            }
+
+            // Make no more than 10 aliases.
+            if(alias_previous->id < (ALIAS_SIZE - 1)){ 
+                // if it is not the initial node then make a new one
+                if(alias_head->id > 0) {
+                    alias_head = (alias*) malloc(sizeof(alias));
+                    if(alias_head == NULL){
+                        print_info("space could not be allocated for new alias.\n", 1);
+                        alias_head = alias_previous;
+                        return alias_head;
+                    }
+                    alias_head->id = alias_previous->id - 1;
+                    alias_head->alias_next = alias_previous;
+                    alias_previous = alias_head;
+                }
+                else {
+                    if(alias_previous->id > -1){ 
+                        alias_current = (alias*) malloc(sizeof(alias));
+                        if(alias_current == NULL){
+                            print_info("space could not be allocated for new alias.\n", 1);
+                            return alias_head;
+                        }
+                        // set up the new node and set it as alais_previous.
+                        alias_current->id = alias_previous->id + 1; 
+                        alias_current->alias_next = alias_previous->alias_next;
+                        alias_previous->alias_next = alias_current;
+                        alias_previous = alias_current;
+                    }
+                    else{ // Just change the alias id to 0 if it is the initial node.
+                        alias_previous->id = 0;
+                    }
+                }
+
+                pos = 2;
+                n_command[0] = '\0';
+                // Make the first argument the key
+                strcpy(alias_previous->key, args[1]);
+                // concatenate all the arguments after 'alias <KEY> ...'
+                while(args[pos] != NULL){ 
+                    strcat(n_command, args[pos]);
+                    strcat(n_command, " ");
+                    pos++;
+                }
+                n_command[strcspn(n_command,"\0") - 1] = '\0';
+                // Make all the arguments after key the  command.
+                strcpy(alias_previous->command, n_command);
+
+                print_info("Alias ", 3);
+                printf("'%s'", alias_previous->key);
+                print_info(" has been assigned to the command ", 3);
+                printf("'%s'\n", alias_previous->command);
+            }
+            else {
+                print_info("Ten aliases already assigned. Please remove some to add more.\n", 2);
+            }
+        } 
+        else {
+            print_info("Arguments missing, could not run command.\n", 1);
+        }
+    } // Remove any set aliases for the command given.
+    else if(strcmp(args[0], "unalias") == 0){ 
+
+        // If no argument is given
+        if(args[1] == NULL){
+            print_info("alias to remove not specified.\n", 1);
+        } // if an argument is given
+        else {
+            pos = 1;
+            n_command[0] = '\0';
+            // Concatenate all the command tokens
+            while(args[pos] != NULL){
+                strcat(n_command, args[pos]);
+                strcat(n_command, " ");
+                pos++;
+            }
+            n_command[strcspn(n_command,"\0") - 1] = '\0';
+
+            char found = 1;
+
+            if(strcmp(alias_previous->command, n_command) == 0){
+                // Catch and remove the first node in the linked list
+                if(alias_previous->alias_next != NULL){
+                    alias_head = alias_current;
+                    free(alias_previous);
+                    found = 0;
+                }
+                else { // Otherwise it is the only alias on the list and should be set to -1 because it is the head of the list.
+                    alias_previous->key[0] = '\0';
+                    alias_previous->command[0] = '\0';
+                    alias_previous->id = -1;
+                    found = 0;
+                }
+            }
+
+            // Search the list for matches.
+            while(alias_current != NULL){ 
+                // If it is a match, remove it.
+                if(strcmp(alias_current->command, n_command) == 0){     
+                    alias_previous->alias_next = alias_current->alias_next;
+                    free(alias_current);
+                    found = 0;
+                }
+                // Search for the next match
+                alias_previous = alias_current;
+                alias_current = alias_current->alias_next;
+            }
+            
+            // tracks whether alias matching the command were found or not and prints the appropriate message.
+            if(found != 0){
+                print_info("command does not have an alias.\n", 2);
+            }
+            else {
+                print_info("All aliases for the command ", 3);
+                printf("'%s'", n_command);
+                print_info(" have been removed.\n", 3);
+            }
+        }
+    }
+    return alias_head;
+}
+
+
+/*
+ * Executes external commands not in internal commands.
+ */
+void external_commands(char **args) {
+
+    pid_t pid;
+    int status;
+    char input[INPUT_SIZE] = { '\0' };
+    int pos = 0;
+
+    //fork a child process
+    pid = fork(); 
+
+    //checks whether the process forks
+    if (pid < 0) { 
+        print_info("Fork failed.\n", 1);
+        exit(-1);
+    }
+
+    //if it is a child process
+    if (!pid) {
+        //checks whether the command can be executed
+        if (execvp(args[0], args) == -1) { 
+
+            while(args[pos] != NULL){
+                strcat(input, args[pos]);
+                strcat(input, " ");
+                pos++;
+            }
+            input[strcspn(input, "\0") - 1] = '\0';
+            
+            print_info("couldn't run the command ", 2);
+            printf("'%s'", input);
+            print_info(". Invalid argument.\n", 3);
+            exit(1);
+        }
+    } //if it is a parent process
+    else { 
+        do {
+            //waiting for the child process
+            waitpid(pid, &status, WUNTRACED); 
+        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+    }
+}
+
+
+/*
+ * Print text with colour.
+ * Level 1 for Error: <MESSAGE>,
+ * Level 2 for Warning: <MESSAGE>,
+ * Level 3 for emphasis.
+ */
+void print_info(char message[500], int level) {
+    switch(level) {
+        case 1:
+            printf("\x1b[31mError:\x1b[0m\x1b[1m %s\x1b[0m", message);
+            break;
+        case 2:
+            printf("\x1b[33mWarning:\x1b[0m\x1b[1m %s\x1b[0m", message);
+            break;
+        case 3:
+            printf("\x1b[1m%s\x1b[0m", message);
+            break;
+        default:
+            printf("%s", message);
+    }
+}
